@@ -2,12 +2,13 @@ import type { AllureTransfer, RequestTask } from '../plugins/allure-types';
 import { logClient } from './helper';
 import { Status } from '../plugins/allure-types';
 import { baseUrlFromUrl, packageLog, swapItems } from '../common';
+import tagToLabel from './tagToLabel';
 import Chainable = Cypress.Chainable;
 import { EventEmitter } from 'events';
 import CommandT = Cypress.CommandT;
 
 const dbg = 'cypress-allure:cy-events';
-const ARGS_TRIM_AT = 80;
+const ARGS_TRIM_AT = 255;
 
 const withTry = (message: string, callback: () => void) => {
   try {
@@ -20,8 +21,7 @@ const withTry = (message: string, callback: () => void) => {
 };
 
 const stepMessage = (name: string, args: string | undefined) => {
-  const argsLine =
-    args && args.length > ARGS_TRIM_AT && name !== 'assert' ? '' : args && args.length > 0 ? `: ${args}` : '';
+  const argsLine = args && args.length > ARGS_TRIM_AT && name !== 'assert' ? '' : args && args.length > 0 ? args : '';
 
   return `${name}${argsLine}`;
 };
@@ -250,6 +250,65 @@ export const handleCyLogEvents = (
   const allLogged: string[] = [];
   const emit = createEmitEvent(runner);
 
+  type TCucumberTag = { name: string };
+  type TCucumberTestState = {
+    gherkinDocument?: {
+      feature: {
+        name: string;
+      };
+    };
+    pickle?: {
+      tags: TCucumberTag[];
+    };
+  };
+
+  const getCucumberTestState = (): TCucumberTestState => {
+    const globalState = globalThis as unknown as { testState: TCucumberTestState } | undefined;
+
+    if (globalState && globalState.testState) {
+      return globalState.testState;
+    }
+
+    return {};
+  };
+
+  const updateLabel = (tag: { name: string }) => {
+    const [name, value] = tagToLabel(tag);
+
+    if (value && name) {
+      Cypress.Allure.label(name, value);
+    }
+
+    if (value && name === 'testID') {
+      Cypress.Allure.label('AS_ID', value);
+    }
+  };
+
+  const updateLabels = () => {
+    const { pickle } = getCucumberTestState();
+
+    if (pickle) {
+      const { tags } = pickle;
+
+      tags.forEach(updateLabel);
+    }
+  };
+
+  const updateFeature = () => {
+    const { gherkinDocument } = getCucumberTestState();
+
+    if (gherkinDocument) {
+      const feature = gherkinDocument.feature.name;
+
+      Cypress.Allure.label('feature', feature);
+    }
+  };
+
+  Cypress.Allure.on('test:ended', () => {
+      updateFeature();
+      updateLabels();
+  });
+
   Cypress.Allure.on('test:started', () => {
     allLogged.splice(0, allLogged.length);
   });
@@ -364,15 +423,78 @@ export const handleCyLogEvents = (
     wrapCustomCommandsFn(commadsFixed, isExclude);
   }
 
+  const cucumberHooksNames = [
+    'Before',
+    'After',
+    '"before each" hook',
+    '"after each" hook',
+    '"after all" hook',
+  ];
+
+  const cucumberStepsNames = [
+    'When',
+    'Then',
+    'Given',
+    'And',
+  ];
+
+  const cucumberLogsNames = [
+    ...cucumberHooksNames,
+    ...cucumberStepsNames,
+  ];
+
+  const hasCucumberStep = (cmdMessage: string): boolean => {
+    return cucumberStepsNames.some((cucumberStepName: string) => {
+      return cmdMessage.startsWith(cucumberStepName);
+    });
+  };
+
+  const hasCucumberLog = (cmdMessage: string): boolean => {
+    return cucumberLogsNames.some((cucumberLogName: string) => {
+      return cmdMessage.startsWith(cucumberLogName);
+    });
+  };
+
+  const startedCucumberSteps: string[] = [];
+
+  const endAllCucumberLogSteps = () => {
+    while (startedCucumberSteps.length > 0) {
+      startedCucumberSteps.pop();
+
+      Cypress.Allure.endStep(Status.PASSED); 
+    }
+  };
+
+  const startLogStep = (cmdMessage: string, isCucumberLog: boolean) => {
+    if (isCucumberLog) {
+      endAllCucumberLogSteps(); 
+
+      startedCucumberSteps.push(cmdMessage);
+    }
+
+    Cypress.Allure.startStep(cmdMessage);
+  };
+
+  const endLogStep = (isCucumberLog: boolean) => {
+    if (!isCucumberLog) {
+      Cypress.Allure.endStep(Status.PASSED);
+    }
+  };
+
   Cypress.on('log:added', async log => {
     if (!allureLogCyCommands()) {
       return;
     }
 
     withTry('report log:added', () => {
-      const cmdMessage = stepMessage(log.name, log.message === 'null' ? '' : log.message);
-      const logName = log.name;
+      const logName = log.name.trim();
+      const isCucumberLog = hasCucumberLog(logName);
+      const stepName = hasCucumberStep(logName) ? `[${logName}]` : logName;
+      const args = log.message === undefined || log.message === 'null' ? '' : log.message.replace('**', '').replace('**', '');
+
+      const cmdMessage = stepMessage(stepName, args);
       const lastAllLoggedCommand = allLogged[allLogged.length - 1];
+
       // const isEnded = log.end;
 
       // logs are being added for all from command log, need to exclude same items
@@ -385,12 +507,12 @@ export const handleCyLogEvents = (
         allLogged.push(cmdMessage);
         debug(`step: ${cmdMessage}`);
 
-        Cypress.Allure.startStep(cmdMessage);
+        startLogStep(cmdMessage, isCucumberLog);
 
         if (logName !== 'assert' && log.message && log.message.length > ARGS_TRIM_AT) {
           Cypress.Allure.attachment(`${cmdMessage} args`, log.message, 'application/json');
         }
-        Cypress.Allure.endStep(Status.PASSED);
+        endLogStep(isCucumberLog);
       }
     });
   });
